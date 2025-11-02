@@ -43,6 +43,13 @@
 #include <lua.h>
 #include <lauxlib.h>
 
+/* Try to detect LuaJIT - it defines LUAJIT_VERSION in luajit.h */
+#if defined(__has_include)
+  #if __has_include(<luajit.h>)
+    #include <luajit.h>
+  #endif
+#endif
+
 #include "strbuf.h"
 #include "fpconv.h"
 
@@ -74,6 +81,9 @@
 #define DEFAULT_DECODE_INVALID_NUMBERS 1
 #define DEFAULT_ENCODE_KEEP_BUFFER 1
 #define DEFAULT_ENCODE_NUMBER_PRECISION 14
+#define DEFAULT_DECODE_KEEP_KEY_ORDER 0
+#define DEFAULT_DECODE_TURBOWARP_EXTENSIONS 0
+#define DEFAULT_DECODE_NULL_AS_NIL 0
 
 #ifdef DISABLE_INVALID_NUMBERS
 #undef DEFAULT_DECODE_INVALID_NUMBERS
@@ -133,6 +143,9 @@ typedef struct {
 
     int decode_invalid_numbers;
     int decode_max_depth;
+    int decode_keep_key_order;      /* Track JSON object key order in metatable */
+    int decode_turbowarp_extensions; /* Enable TurboWarp JSON extensions (Infinity, NaN) */
+    int decode_null_as_nil;         /* Decode JSON null as Lua nil (skip key) instead of lightuserdata */
 } json_config_t;
 
 typedef struct {
@@ -362,6 +375,52 @@ static int json_cfg_decode_invalid_numbers(lua_State *l)
     return 1;
 }
 
+static int json_cfg_decode_keep_key_order(lua_State *l)
+{
+    json_config_t *cfg = json_arg_init(l, 1);
+
+    return json_enum_option(l, 1, &cfg->decode_keep_key_order, NULL, 1);
+}
+
+static int json_cfg_decode_turbowarp_extensions(lua_State *l)
+{
+    json_config_t *cfg = json_arg_init(l, 1);
+
+    return json_enum_option(l, 1, &cfg->decode_turbowarp_extensions, NULL, 1);
+}
+
+static int json_cfg_decode_null_as_nil(lua_State *l)
+{
+    json_config_t *cfg = json_arg_init(l, 1);
+
+    return json_enum_option(l, 1, &cfg->decode_null_as_nil, NULL, 1);
+}
+
+/* Extract key order from a table's metatable (if available)
+ * Compatible with json.lua's getKeyOrder() function
+ * Returns: keyOrder array or nil */
+static int json_get_key_order(lua_State *l)
+{
+    luaL_argcheck(l, lua_gettop(l) == 1, 1, "expected 1 argument");
+
+    if (!lua_istable(l, 1)) {
+        lua_pushnil(l);
+        return 1;
+    }
+
+    /* Get metatable */
+    if (!lua_getmetatable(l, 1)) {
+        lua_pushnil(l);
+        return 1;
+    }
+
+    /* Get __keyOrder field from metatable */
+    lua_getfield(l, -1, "__keyOrder");
+
+    /* Return __keyOrder (or nil if not found) */
+    return 1;
+}
+
 static int json_destroy_config(lua_State *l)
 {
     json_config_t *cfg;
@@ -396,6 +455,9 @@ static void json_create_config(lua_State *l)
     cfg->decode_invalid_numbers = DEFAULT_DECODE_INVALID_NUMBERS;
     cfg->encode_keep_buffer = DEFAULT_ENCODE_KEEP_BUFFER;
     cfg->encode_number_precision = DEFAULT_ENCODE_NUMBER_PRECISION;
+    cfg->decode_keep_key_order = DEFAULT_DECODE_KEEP_KEY_ORDER;
+    cfg->decode_turbowarp_extensions = DEFAULT_DECODE_TURBOWARP_EXTENSIONS;
+    cfg->decode_null_as_nil = DEFAULT_DECODE_NULL_AS_NIL;
 
 #if DEFAULT_ENCODE_KEEP_BUFFER > 0
     strbuf_init(&cfg->encode_buf, 0);
@@ -1087,6 +1149,19 @@ static void json_next_token(json_parse_t *json, json_token_t *token)
         token->type = T_NULL;
         json->ptr += 4;
         return;
+    } else if (json->cfg->decode_turbowarp_extensions) {
+        /* TurboWarp JSON extensions: Infinity, -Infinity, NaN */
+        if (!strncmp(json->ptr, "Infinity", 8)) {
+            token->type = T_NUMBER;
+            token->value.number = INFINITY;
+            json->ptr += 8;
+            return;
+        } else if (!strncmp(json->ptr, "NaN", 3)) {
+            token->type = T_NUMBER;
+            token->value.number = NAN;
+            json->ptr += 3;
+            return;
+        }
     } else if (json->cfg->decode_invalid_numbers &&
                json_is_invalid_number(json)) {
         /* When decode_invalid_numbers is enabled, only attempt to process
@@ -1147,17 +1222,34 @@ static void json_decode_descend(lua_State *l, json_parse_t *json, int slots)
 static void json_parse_object_context(lua_State *l, json_parse_t *json)
 {
     json_token_t token;
+    int key_count = 0;
+    int track_order = json->cfg->decode_keep_key_order;
 
-    /* 3 slots required:
+    /* 4 slots required when tracking order:
+     * .., table, keyOrder, key, value
+     * 3 slots when not tracking:
      * .., table, key, value */
-    json_decode_descend(l, json, 3);
+    json_decode_descend(l, json, track_order ? 4 : 3);
 
-    lua_newtable(l);
+    lua_newtable(l);  /* Create object table */
+
+    /* If tracking order, create keyOrder array immediately */
+    if (track_order) {
+        lua_newtable(l);  /* Create keyOrder array */
+    }
 
     json_next_token(json, &token);
 
     /* Handle empty objects */
     if (token.type == T_OBJ_END) {
+        if (track_order) {
+            /* Stack: ..., table, keyOrder */
+            lua_newtable(l);                      /* Stack: ..., table, keyOrder, mt */
+            lua_pushvalue(l, -2);                 /* Stack: ..., table, keyOrder, mt, keyOrder */
+            lua_setfield(l, -2, "__keyOrder");    /* Stack: ..., table, keyOrder, mt */
+            lua_setmetatable(l, -3);              /* Stack: ..., table, keyOrder */
+            lua_pop(l, 1);                        /* Stack: ..., table */
+        }
         json_decode_ascend(json);
         return;
     }
@@ -1169,6 +1261,13 @@ static void json_parse_object_context(lua_State *l, json_parse_t *json)
         /* Push key */
         lua_pushlstring(l, token.value.string, token.string_len);
 
+        /* Track key order if enabled */
+        if (track_order) {
+            /* Stack: ..., table, keyOrder, key */
+            lua_pushvalue(l, -1);                 /* Stack: ..., table, keyOrder, key, key */
+            lua_rawseti(l, -3, ++key_count);      /* keyOrder[key_count] = key; Stack: ..., table, keyOrder, key */
+        }
+
         json_next_token(json, &token);
         if (token.type != T_COLON)
             json_throw_parse_error(l, json, "colon", &token);
@@ -1178,11 +1277,25 @@ static void json_parse_object_context(lua_State *l, json_parse_t *json)
         json_process_value(l, json, &token);
 
         /* Set key = value */
-        lua_rawset(l, -3);
+        if (track_order) {
+            /* Stack: ..., table, keyOrder, key, value */
+            lua_rawset(l, -4);                    /* table[key] = value; Stack: ..., table, keyOrder */
+        } else {
+            /* Stack: ..., table, key, value */
+            lua_rawset(l, -3);                    /* table[key] = value; Stack: ..., table */
+        }
 
         json_next_token(json, &token);
 
         if (token.type == T_OBJ_END) {
+            if (track_order) {
+                /* Stack: ..., table, keyOrder */
+                lua_newtable(l);                  /* Stack: ..., table, keyOrder, mt */
+                lua_pushvalue(l, -2);             /* Stack: ..., table, keyOrder, mt, keyOrder */
+                lua_setfield(l, -2, "__keyOrder"); /* Stack: ..., table, keyOrder, mt */
+                lua_setmetatable(l, -3);          /* Stack: ..., table, keyOrder */
+                lua_pop(l, 1);                    /* Stack: ..., table */
+            }
             json_decode_ascend(json);
             return;
         }
@@ -1254,8 +1367,13 @@ static void json_process_value(lua_State *l, json_parse_t *json,
         break;;
     case T_NULL:
         /* In Lua, setting "t[k] = nil" will delete k from the table.
-         * Hence a NULL pointer lightuserdata object is used instead */
-        lua_pushlightuserdata(l, NULL);
+         * By default, use lightuserdata to preserve the key.
+         * If decode_null_as_nil is enabled, push nil (key will be deleted). */
+        if (json->cfg->decode_null_as_nil) {
+            lua_pushnil(l);
+        } else {
+            lua_pushlightuserdata(l, NULL);
+        }
         break;;
     default:
         json_throw_parse_error(l, json, "value", token);
@@ -1304,8 +1422,8 @@ static int json_decode(lua_State *l)
 
 /* ===== INITIALISATION ===== */
 
-#if !defined(LUA_VERSION_NUM) || LUA_VERSION_NUM < 502
-/* Compatibility for Lua 5.1.
+#if !defined(LUA_VERSION_NUM) || (LUA_VERSION_NUM < 502 && !defined(LUAJIT_VERSION))
+/* Compatibility for Lua 5.1 (but not LuaJIT which already has luaL_setfuncs).
  *
  * luaL_setfuncs() is used to create a module table where the functions have
  * json_config_t as their first upvalue. Code borrowed from Lua 5.2 source. */
@@ -1365,6 +1483,10 @@ static int lua_cjson_new(lua_State *l)
         { "encode_keep_buffer", json_cfg_encode_keep_buffer },
         { "encode_invalid_numbers", json_cfg_encode_invalid_numbers },
         { "decode_invalid_numbers", json_cfg_decode_invalid_numbers },
+        { "decode_keep_key_order", json_cfg_decode_keep_key_order },
+        { "decode_turbowarp_extensions", json_cfg_decode_turbowarp_extensions },
+        { "decode_null_as_nil", json_cfg_decode_null_as_nil },
+        { "get_key_order", json_get_key_order },
         { "new", lua_cjson_new },
         { NULL, NULL }
     };
